@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>台股每日分析</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --up:#d0021b;      /* 台灣習慣：紅=漲 */
+    --down:#1a9850;    /* 綠=跌 */
+    --flat:#666;
+    --bg:#faf7f2;
+    --card:#ffffff;
+    --text:#222;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif;
+    background:var(--bg);color:var(--text);
+    padding:16px;max-width:900px;margin:0 auto;
+  }
+  header{text-align:center;margin-bottom:8px}
+  h1{font-size:34px;margin-bottom:4px}
+  #stamp{font-size:20px;color:#555}
+  #refreshBtn{
+    display:block;margin:14px auto;padding:16px 48px;
+    font-size:26px;font-weight:bold;border:none;border-radius:14px;
+    background:#2c5f8a;color:#fff;cursor:pointer;
+  }
+  #refreshBtn:active{background:#1d4463}
+  .card{
+    background:var(--card);border-radius:18px;
+    box-shadow:0 2px 8px rgba(0,0,0,.08);
+    padding:22px;margin-bottom:26px;
+  }
+  .card h2{font-size:30px;margin-bottom:6px}
+  .lastdate{font-size:19px;color:#777;margin-bottom:10px}
+  .bigrow{display:flex;align-items:baseline;flex-wrap:wrap;gap:14px}
+  .price{font-size:64px;font-weight:900;line-height:1.1}
+  .chg{font-size:38px;font-weight:800}
+  .up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--flat)}
+  .advice{
+    margin-top:14px;padding:16px;border-radius:12px;
+    font-size:24px;line-height:1.6;background:#fdf6e3;
+    border-left:8px solid #e0a800;
+  }
+  .sect{font-size:22px;font-weight:bold;color:#2c5f8a;margin:18px 0 6px}
+  table.detail{
+    width:100%;border-collapse:collapse;font-size:21px;
+  }
+  table.detail td{
+    padding:9px 6px;border-bottom:1px solid #eee;line-height:1.4;
+  }
+  table.detail td.k{color:#666;white-space:nowrap;width:42%}
+  table.detail td.v{font-weight:bold;text-align:right}
+  .chartbox{margin-top:16px;height:230px}
+  .status{text-align:center;font-size:24px;color:#555;padding:30px}
+  .error{
+    background:#fdeaea;border-left:8px solid var(--up);
+    padding:16px;border-radius:12px;font-size:23px;margin-bottom:20px;
+  }
+  footer{
+    text-align:center;font-size:17px;color:#888;
+    margin:26px 0 40px;line-height:1.6;
+  }
+  @media(max-width:480px){
+    .price{font-size:50px}.chg{font-size:30px}
+    h1{font-size:28px}.advice{font-size:21px}
+    table.detail{font-size:19px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 台股每日分析</h1>
+  <div id="stamp">載入中…</div>
+  <button id="refreshBtn" onclick="loadAll()">🔄 更新資料</button>
+</header>
+
+<div id="errbox"></div>
+<div id="content"><div class="status">正在抓取最新資料，請稍等幾秒…<br>（資料較多，約需 5～10 秒）</div></div>
+
+<footer>
+  資料來源：FinMind／台灣證券交易所（收盤資料，非即時報價）<br>
+  本頁面僅為資訊整理與參考，不構成任何投資建議。投資有風險，買賣前請自行評估。
+</footer>
+
+<script>
+/* ====== 追蹤標的設定 ====== */
+const TARGETS = [
+  { id:"TAIEX", name:"台股大盤（加權指數）", isIndex:true },
+  { id:"2451",  name:"創見（2451）",  isIndex:false },
+  { id:"2377",  name:"微星（2377）",  isIndex:false },
+];
+const API = "https://api.finmindtrade.com/api/v4/data";
+const INST_NAMES = {Foreign_Investor:"外資", Investment_Trust:"投信", Dealer_self:"自營商"};
+
+/* ====== 小工具 ====== */
+function daysAgoISO(n){
+  const d = new Date(); d.setDate(d.getDate()-n);
+  return d.toISOString().slice(0,10);
+}
+function fmtNum(x, dec){
+  return Number(x).toLocaleString("zh-TW",{minimumFractionDigits:dec,maximumFractionDigits:dec});
+}
+function pctCell(p){
+  if(p===null||isNaN(p)) return '<span class="flat">—</span>';
+  const cls = p>0?"up":(p<0?"down":"flat");
+  const sign = p>0?"+":"";
+  return `<span class="${cls}">${sign}${p.toFixed(1)}%</span>`;
+}
+function signedCell(v, unit, dec=0){
+  if(v===null||isNaN(v)) return '<span class="flat">—</span>';
+  const cls = v>0?"up":(v<0?"down":"flat");
+  const sign = v>0?"+":"";
+  return `<span class="${cls}">${sign}${fmtNum(v,dec)} ${unit}</span>`;
+}
+function fetchJSON(params){
+  const qs = new URLSearchParams(params).toString();
+  return fetch(API + "?" + qs).then(r=>{
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(j=>{
+    if(j.status!==200) throw new Error(j.msg||"API 錯誤");
+    return j.data||[];
+  });
+}
+/* 抓不到就回 null，不讓整頁失敗 */
+function tryFetch(params){ return fetchJSON(params).catch(()=>null); }
+
+/* ====== 統計計算 ====== */
+function avg(arr){ return arr.reduce((a,b)=>a+b,0)/arr.length; }
+function pctChange(closes, n){
+  const len = closes.length;
+  if(len < n+1) return null;
+  const base = closes[len-1-n];
+  return (closes[len-1]-base)/base*100;
+}
+/* 法人資料 → 每日淨買賣（股） */
+function instDaily(rows, who){
+  const m = {};
+  (rows||[]).forEach(r=>{
+    if(r.name!==who) return;
+    m[r.date] = (m[r.date]||0) + (r.buy - r.sell);
+  });
+  return Object.keys(m).sort().map(d=>({date:d, net:m[d]}));
+}
+function instNetSum(daily, n){
+  if(!daily.length) return null;
+  return daily.slice(-n).reduce((a,b)=>a+b.net,0);
+}
+function instStreak(daily){
+  if(!daily.length) return 0;
+  let s=0;
+  for(let i=daily.length-1;i>=0;i--){
+    const dir = Math.sign(daily[i].net);
+    if(i===daily.length-1){ s=dir; }
+    else if(Math.sign(daily[i].net)===Math.sign(s)&&dir!==0){ s+=dir; }
+    else break;
+  }
+  return s; /* 正=連買天數，負=連賣天數 */
+}
+
+/* ====== 個股統計包 ====== */
+function buildStats(rows, extra){
+  const closes = rows.map(r=>r.close);
+  const last = rows[rows.length-1];
+  const stats = {
+    last,
+    todayPct: last.spread/(last.close-last.spread)*100,
+    w1: pctChange(closes,5),
+    m1: pctChange(closes,20),
+    m3: pctChange(closes,60),
+    hi52: Math.max(...closes),
+    lo52: Math.min(...closes),
+    ma5:  closes.length>=5 ? avg(closes.slice(-5)) : null,
+    ma20: closes.length>=20 ? avg(closes.slice(-20)) : null,
+    vol: last.Trading_Volume,
+    volRatio: null, fiNet5:null, fiStreak:0, itNet5:null,
+    revYoY:null, revLatest:null, epsQ:null, eps4Q:null, per:null,
+  };
+  const vols = rows.map(r=>r.Trading_Volume).filter(v=>v>0);
+  if(vols.length>=21){
+    stats.volRatio = last.Trading_Volume / avg(vols.slice(-21,-1));
+  }
+  const dd = (Math.max(...closes.slice(-60)) - last.close)/Math.max(...closes.slice(-60))*100;
+  stats.drawdown60 = dd;
+
+  if(extra.inst){
+    const fi = instDaily(extra.inst,"Foreign_Investor");
+    const it = instDaily(extra.inst,"Investment_Trust");
+    stats.fiNet5 = instNetSum(fi,5);
+    stats.itNet5 = instNetSum(it,5);
+    stats.fiStreak = instStreak(fi);
+  }
+  if(extra.rev && extra.rev.length){
+    extra.rev.sort((a,b)=>a.date<b.date?-1:1);
+    const r = extra.rev[extra.rev.length-1];
+    stats.revLatest = r;
+    const prev = extra.rev.find(x=>x.revenue_year===r.revenue_year-1 && x.revenue_month===r.revenue_month);
+    if(prev) stats.revYoY = (r.revenue-prev.revenue)/prev.revenue*100;
+  }
+  if(extra.fin){
+    const eps = extra.fin.filter(x=>x.type==="EPS").sort((a,b)=>a.date<b.date?-1:1);
+    if(eps.length){
+      stats.epsQ = eps[eps.length-1];
+      if(eps.length>=4) stats.eps4Q = eps.slice(-4).reduce((a,b)=>a+b.value,0);
+    }
+  }
+  if(extra.per && extra.per.length) stats.per = extra.per[extra.per.length-1];
+  return stats;
+}
+
+/* ====== 白話分析引擎 ====== */
+function analyze(st, isIndex){
+  const s = [];
+  const unit = isIndex?"點":"元";
+  const dec = isIndex?0:1;
+  if(st.last.spread>0)      s.push(`今天上漲，收在 ${fmtNum(st.last.close,dec)}${unit}。`);
+  else if(st.last.spread<0) s.push(`今天下跌，收在 ${fmtNum(st.last.close,dec)}${unit}。`);
+  else                      s.push(`今天平盤，收在 ${fmtNum(st.last.close,dec)}${unit}。`);
+
+  let tone="flat";
+  if(st.ma5 && st.ma20){
+    if(st.last.close>st.ma5 && st.ma5>st.ma20){ s.push("最近走勢偏強，短期在往上走。"); tone="up"; }
+    else if(st.last.close<st.ma5 && st.ma5<st.ma20){ s.push("最近走勢偏弱，短期在往下走。"); tone="down"; }
+    else s.push("最近上上下下、方向不明，屬於盤整階段。");
+  }
+
+  /* 法人動向 */
+  if(st.fiStreak>=3) s.push(`外資已經連續買超 ${st.fiStreak} 天，大戶看好，是加分項。`);
+  else if(st.fiStreak<=-3) s.push(`外資已經連續賣超 ${Math.abs(st.fiStreak)} 天，大戶在退場，短期賣壓比較重。`);
+
+  /* 營收 */
+  if(st.revYoY!==null){
+    if(st.revYoY>=20) s.push(`最新月營收比去年同月成長 ${st.revYoY.toFixed(0)}%，生意越做越好，基本面加分。`);
+    else if(st.revYoY<=-10) s.push(`最新月營收比去年同月衰退 ${Math.abs(st.revYoY).toFixed(0)}%，基本面要多留意。`);
+  }
+
+  /* 風險與結論 */
+  if(st.drawdown60>=15){
+    s.push(`目前比近三個月高點低了約 ${st.drawdown60.toFixed(0)}%，波動較大，保守的人先觀望，不要急著進場；有持股的人要想清楚自己能承受多少。`);
+  }else if(st.drawdown60>=8){
+    s.push(`比近期高點低了約 ${st.drawdown60.toFixed(0)}%，有持股先不用緊張，但不建議一次大筆買進。`);
+  }else if(tone==="up" && st.w1!==null && st.w1>5){
+    s.push("短時間漲比較快，想買的人建議分批，不要一次全押。");
+  }else if(tone==="up"){
+    s.push("走勢穩定，有持股的人可以續抱，照原本的計畫就好。");
+  }else{
+    s.push("沒有特別異常，維持平常心，不需要因為單日漲跌做決定。");
+  }
+  return s.join("");
+}
+
+/* ====== 畫面 ====== */
+let charts = [];
+
+function detailRowsStock(st){
+  const rows = [];
+  rows.push(["近一週漲跌", pctCell(st.w1)]);
+  rows.push(["近一個月漲跌", pctCell(st.m1)]);
+  rows.push(["近三個月漲跌", pctCell(st.m3)]);
+  rows.push(["近一年最高／最低", `${fmtNum(st.hi52,1)} ／ ${fmtNum(st.lo52,1)} 元`]);
+  if(st.vol) rows.push(["今日成交量", fmtNum(st.vol/1000,0)+" 張" + (st.volRatio?`（近20日平均的 ${st.volRatio.toFixed(1)} 倍）`:"")]);
+  if(st.fiNet5!==null) rows.push(["外資近5日買賣超", signedCell(st.fiNet5/1000,"張")]);
+  if(st.itNet5!==null) rows.push(["投信近5日買賣超", signedCell(st.itNet5/1000,"張")]);
+  if(st.revLatest) rows.push([`${st.revLatest.revenue_month} 月營收`, fmtNum(st.revLatest.revenue/1e8,1)+" 億元" + (st.revYoY!==null?`（年增 ${pctCell(st.revYoY)}）`:"")]);
+  if(st.epsQ) rows.push(["最新一季 EPS", fmtNum(st.epsQ.value,2)+" 元"]);
+  if(st.eps4Q) rows.push(["近四季 EPS 合計", fmtNum(st.eps4Q,2)+" 元"]);
+  if(st.per){
+    rows.push(["本益比／股價淨值比", `${st.per.PER} 倍 ／ ${st.per.PBR}`]);
+    rows.push(["現金殖利率", st.per.dividend_yield+"%"]);
+  }
+  return rows;
+}
+function detailRowsIndex(st, totalInst){
+  const rows = [];
+  rows.push(["近一週漲跌", pctCell(st.w1)]);
+  rows.push(["近一個月漲跌", pctCell(st.m1)]);
+  rows.push(["近三個月漲跌", pctCell(st.m3)]);
+  rows.push(["近一年最高／最低", `${fmtNum(st.hi52,0)} ／ ${fmtNum(st.lo52,0)} 點`]);
+  if(st.last.Trading_money) rows.push(["今日成交金額", fmtNum(st.last.Trading_money/1e8,0)+" 億元"]);
+  if(totalInst && totalInst.length){
+    const dates=[...new Set(totalInst.map(r=>r.date))].sort();
+    const lastD=dates[dates.length-1];
+    const get=n=>{const r=totalInst.find(x=>x.date===lastD&&x.name===n);return r?(r.buy-r.sell)/1e8:null;};
+    const fi=get("Foreign_Investor"), it=get("Investment_Trust"), tot=get("total");
+    if(tot!==null) rows.push([`三大法人買賣超（${lastD.slice(5).replace("-","/")}）`, signedCell(tot,"億")]);
+    if(fi!==null) rows.push(["其中外資", signedCell(fi,"億")]);
+    if(it!==null) rows.push(["其中投信", signedCell(it,"億")]);
+  }
+  return rows;
+}
+
+function cardHTML(t, st, detailRows){
+  const dec = t.isIndex?0:1;
+  const cls = st.last.spread>0?"up":(st.last.spread<0?"down":"flat");
+  const arrow = st.last.spread>0?"▲":(st.last.spread<0?"▼":"—");
+  const pctTxt = (st.todayPct>=0?"+":"")+st.todayPct.toFixed(2)+"%";
+  const dateTxt = st.last.date.replace(/-/g,"/") + "（收盤）";
+  const table = detailRows.map(r=>`<tr><td class="k">${r[0]}</td><td class="v">${r[1]}</td></tr>`).join("");
+  return `
+  <div class="card">
+    <h2>${t.name}</h2>
+    <div class="lastdate">${dateTxt}</div>
+    <div class="bigrow">
+      <span class="price ${cls}">${fmtNum(st.last.close,dec)}</span>
+      <span class="chg ${cls}">${arrow} ${fmtNum(Math.abs(st.last.spread),dec)}（${pctTxt}）</span>
+    </div>
+    <div class="advice">💬 ${analyze(st, t.isIndex)}</div>
+    <div class="sect">📋 詳細數據</div>
+    <table class="detail">${table}</table>
+    <div class="chartbox"><canvas id="chart_${t.id}"></canvas></div>
+  </div>`;
+}
+
+function drawChart(t, rows){
+  const ctx = document.getElementById("chart_"+t.id);
+  if(!ctx || typeof Chart==="undefined") return;
+  const view = rows.slice(-65); /* 近三個月 */
+  const first = view[0].close, last = view[view.length-1].close;
+  const color = last>=first ? "#d0021b" : "#1a9850";
+  charts.push(new Chart(ctx,{
+    type:"line",
+    data:{
+      labels:view.map(r=>r.date.slice(5).replace("-","/")),
+      datasets:[{
+        data:view.map(r=>r.close),
+        borderColor:color, borderWidth:3,
+        backgroundColor:color+"22", fill:true,
+        pointRadius:0, tension:.25,
+      }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false},
+        title:{display:true,text:"近三個月走勢",font:{size:18}}},
+      scales:{
+        x:{ticks:{maxTicksLimit:6,font:{size:15}}},
+        y:{ticks:{font:{size:15}}}
+      }
+    }
+  }));
+}
+
+/* ====== 主流程 ====== */
+async function loadAll(){
+  const content = document.getElementById("content");
+  const errbox = document.getElementById("errbox");
+  errbox.innerHTML = "";
+  content.innerHTML = '<div class="status">正在抓取最新資料，請稍等幾秒…<br>（資料較多，約需 5～10 秒）</div>';
+  charts.forEach(c=>c.destroy()); charts=[];
+  const yearAgo = daysAgoISO(380);
+
+  try{
+    const totalInstP = tryFetch({dataset:"TaiwanStockTotalInstitutionalInvestors", start_date:daysAgoISO(10)});
+    const results = await Promise.all(TARGETS.map(async t=>{
+      const rows = await fetchJSON({dataset:"TaiwanStockPrice", data_id:t.id, start_date:yearAgo});
+      if(!rows.length) throw new Error(t.name+" 無資料");
+      const extra = {};
+      if(!t.isIndex){
+        const [per, inst, rev, fin] = await Promise.all([
+          tryFetch({dataset:"TaiwanStockPER", data_id:t.id, start_date:daysAgoISO(10)}),
+          tryFetch({dataset:"TaiwanStockInstitutionalInvestorsBuySell", data_id:t.id, start_date:daysAgoISO(15)}),
+          tryFetch({dataset:"TaiwanStockMonthRevenue", data_id:t.id, start_date:daysAgoISO(430)}),
+          tryFetch({dataset:"TaiwanStockFinancialStatements", data_id:t.id, start_date:daysAgoISO(430)}),
+        ]);
+        extra.per=per; extra.inst=inst; extra.rev=rev; extra.fin=fin;
+      }
+      return {t, rows, st:buildStats(rows, extra)};
+    }));
+    const totalInst = await totalInstP;
+
+    content.innerHTML = results.map(r=>{
+      const dr = r.t.isIndex ? detailRowsIndex(r.st, totalInst) : detailRowsStock(r.st);
+      return cardHTML(r.t, r.st, dr);
+    }).join("");
+    results.forEach(r=>drawChart(r.t, r.rows));
+
+    const lastDate = results[0].rows[results[0].rows.length-1].date;
+    document.getElementById("stamp").textContent =
+      "最新收盤日：" + lastDate.replace(/-/g,"/") + "　（更新時間 " +
+      new Date().toLocaleTimeString("zh-TW",{hour:"2-digit",minute:"2-digit"}) + "）";
+  }catch(err){
+    errbox.innerHTML = `<div class="error">⚠️ 資料抓取失敗（${err.message}）。<br>
+      請確認有連上網路，然後按上面的「更新資料」再試一次。<br>
+      若一直失敗，可能是資料來源暫時流量管制，過幾分鐘再按即可。</div>`;
+    content.innerHTML = "";
+    document.getElementById("stamp").textContent = "尚未更新";
+  }
+}
+loadAll();
+/* 開著頁面時每 30 分鐘自動更新一次 */
+setInterval(loadAll, 30*60*1000);
+</script>
+</body>
+</html>
