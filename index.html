@@ -54,7 +54,15 @@
   }
   table.detail td.k{color:#666;white-space:nowrap;width:42%}
   table.detail td.v{font-weight:bold;text-align:right}
-  .chartbox{margin-top:16px;height:230px}
+  .chartbox{margin-top:16px;height:260px}
+  .volbox{height:90px;margin-top:2px}
+  ul.news{list-style:none;margin-top:4px}
+  ul.news li{
+    padding:9px 4px;border-bottom:1px solid #eee;
+    font-size:19px;line-height:1.45;
+  }
+  ul.news a{color:#2c5f8a;text-decoration:none}
+  ul.news .src{color:#999;font-size:16px;margin-left:6px;white-space:nowrap}
   .status{text-align:center;font-size:24px;color:#555;padding:30px}
   .error{
     background:#fdeaea;border-left:8px solid var(--up);
@@ -186,6 +194,18 @@ function buildStats(rows, extra){
   }
   const dd = (Math.max(...closes.slice(-60)) - last.close)/Math.max(...closes.slice(-60))*100;
   stats.drawdown60 = dd;
+  /* RSI(14) */
+  if(closes.length>=15){
+    let g=0,l=0;
+    for(let i=closes.length-14;i<closes.length;i++){
+      const c=closes[i]-closes[i-1];
+      if(c>0) g+=c; else l-=c;
+    }
+    stats.rsi = l===0 ? 100 : 100-100/(1+g/l);
+  } else stats.rsi=null;
+  /* 月支撐 / 壓力（近20交易日低點與高點） */
+  stats.lo20 = Math.min(...closes.slice(-20));
+  stats.hi20 = Math.max(...closes.slice(-20));
 
   if(extra.inst){
     const fi = instDaily(extra.inst,"Foreign_Investor");
@@ -262,6 +282,8 @@ function detailRowsStock(st){
   rows.push(["近一個月漲跌", pctCell(st.m1)]);
   rows.push(["近三個月漲跌", pctCell(st.m3)]);
   rows.push(["近一年最高／最低", `${fmtNum(st.hi52,1)} ／ ${fmtNum(st.lo52,1)} 元`]);
+  rows.push(["近月壓力／支撐", `${fmtNum(st.hi20,1)} ／ ${fmtNum(st.lo20,1)} 元`]);
+  if(st.rsi!==null) rows.push(["RSI（14日強弱）", st.rsi.toFixed(0) + (st.rsi>=70?"（偏熱）":st.rsi<=30?"（偏冷）":"（中性）")]);
   if(st.vol) rows.push(["今日成交量", fmtNum(st.vol/1000,0)+" 張" + (st.volRatio?`（近20日平均的 ${st.volRatio.toFixed(1)} 倍）`:"")]);
   if(st.fiNet5!==null) rows.push(["外資近5日買賣超", signedCell(st.fiNet5/1000,"張")]);
   if(st.itNet5!==null) rows.push(["投信近5日買賣超", signedCell(st.itNet5/1000,"張")]);
@@ -293,7 +315,23 @@ function detailRowsIndex(st, totalInst){
   return rows;
 }
 
-function cardHTML(t, st, detailRows){
+function newsHTML(news){
+  if(!news || !news.length) return "";
+  const seen = new Set();
+  const items = [];
+  for(let i=news.length-1; i>=0 && items.length<5; i--){
+    const n = news[i];
+    const key = (n.title||"").slice(0,18);
+    if(seen.has(key)) continue;
+    seen.add(key);
+    const title = (n.title||"").replace(/ - [^-]*$/,"");
+    items.push(`<li>・<a href="${n.link}" target="_blank" rel="noopener">${title}</a><span class="src">${n.source||""} ${String(n.date||"").slice(5,16)}</span></li>`);
+  }
+  if(!items.length) return "";
+  return `<div class="sect">📰 最新消息（點標題可看全文）</div><ul class="news">${items.join("")}</ul>`;
+}
+
+function cardHTML(t, st, detailRows, news){
   const dec = t.isIndex?0:1;
   const cls = st.last.spread>0?"up":(st.last.spread<0?"down":"flat");
   const arrow = st.last.spread>0?"▲":(st.last.spread<0?"▼":"—");
@@ -312,36 +350,83 @@ function cardHTML(t, st, detailRows){
     <div class="sect">📋 詳細數據</div>
     <table class="detail">${table}</table>
     <div class="chartbox"><canvas id="chart_${t.id}"></canvas></div>
+    <div class="volbox"><canvas id="vol_${t.id}"></canvas></div>
+    ${newsHTML(news)}
   </div>`;
+}
+
+function movingAvg(arr, n){
+  return arr.map((_,i)=> i<n-1 ? null : avg(arr.slice(i-n+1,i+1)));
 }
 
 function drawChart(t, rows){
   const ctx = document.getElementById("chart_"+t.id);
+  const vctx = document.getElementById("vol_"+t.id);
   if(!ctx || typeof Chart==="undefined") return;
-  const view = rows.slice(-65); /* 近三個月 */
-  const first = view[0].close, last = view[view.length-1].close;
-  const color = last>=first ? "#d0021b" : "#1a9850";
+  const view = rows.slice(-60); /* 近三個月 */
+  const labels = view.map(r=>r.date.slice(5).replace("-","/"));
+  const UP="#d0021b", DOWN="#1a9850";
+  const colors = view.map(r=> r.close>=r.open ? UP : DOWN);
+  const closesAll = rows.map(r=>r.close);
+  const ma5 = movingAvg(closesAll,5).slice(-60);
+  const ma20 = movingAvg(closesAll,20).slice(-60);
+
+  /* K線：影線（細）＋實體（粗）用浮動長條模擬 */
   charts.push(new Chart(ctx,{
-    type:"line",
     data:{
-      labels:view.map(r=>r.date.slice(5).replace("-","/")),
-      datasets:[{
-        data:view.map(r=>r.close),
-        borderColor:color, borderWidth:3,
-        backgroundColor:color+"22", fill:true,
-        pointRadius:0, tension:.25,
-      }]
+      labels,
+      datasets:[
+        {type:"bar", label:"影線",
+         data:view.map(r=>[r.min, r.max]),
+         backgroundColor:colors, barPercentage:0.18,
+         categoryPercentage:1, order:3},
+        {type:"bar", label:"K線",
+         data:view.map(r=>[Math.min(r.open,r.close), Math.max(r.open,r.close)===Math.min(r.open,r.close)? Math.min(r.open,r.close)*1.0005 : Math.max(r.open,r.close)]),
+         backgroundColor:colors, barPercentage:0.75,
+         categoryPercentage:1, order:2},
+        {type:"line", label:"5日均線", data:ma5,
+         borderColor:"#f5a623", borderWidth:2, pointRadius:0, tension:.2, order:1},
+        {type:"line", label:"20日均線", data:ma20,
+         borderColor:"#4a90d9", borderWidth:2, pointRadius:0, tension:.2, order:1},
+      ]
     },
     options:{
-      responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{display:false},
-        title:{display:true,text:"近三個月走勢",font:{size:18}}},
+      responsive:true, maintainAspectRatio:false, animation:false,
+      plugins:{
+        legend:{display:true, labels:{font:{size:15},
+          filter:i=>i.text.includes("均線")}},
+        title:{display:true,text:"近三個月 K線圖（紅漲綠跌）",font:{size:18}},
+        tooltip:{callbacks:{label:(c)=>{
+          const r=view[c.dataIndex];
+          return c.datasetIndex<=1 ? `開${r.open} 高${r.max} 低${r.min} 收${r.close}` : `${c.dataset.label} ${c.parsed.y?.toFixed(1)}`;
+        }}}
+      },
       scales:{
-        x:{ticks:{maxTicksLimit:6,font:{size:15}}},
-        y:{ticks:{font:{size:15}}}
+        x:{ticks:{maxTicksLimit:6,font:{size:14}}},
+        y:{ticks:{font:{size:14}}, grace:"2%"}
       }
     }
   }));
+
+  /* 成交量副圖 */
+  if(vctx){
+    const volDiv = t.isIndex ? 1e8 : 1000; /* 大盤:億元、個股:張 */
+    charts.push(new Chart(vctx,{
+      type:"bar",
+      data:{labels,
+        datasets:[{data:view.map(r=> (t.isIndex? r.Trading_money : r.Trading_Volume)/volDiv),
+          backgroundColor:colors.map(c=>c+"99"), barPercentage:0.7}]},
+      options:{
+        responsive:true, maintainAspectRatio:false, animation:false,
+        plugins:{legend:{display:false},
+          title:{display:true,text:t.isIndex?"成交金額（億元）":"成交量（張）",font:{size:14},padding:2}},
+        scales:{
+          x:{display:false},
+          y:{ticks:{font:{size:12},maxTicksLimit:3}}
+        }
+      }
+    }));
+  }
 }
 
 /* ====== 主流程 ====== */
@@ -359,22 +444,24 @@ async function loadAll(){
       const rows = await fetchJSON({dataset:"TaiwanStockPrice", data_id:t.id, start_date:yearAgo});
       if(!rows.length) throw new Error(t.name+" 無資料");
       const extra = {};
+      let news = null;
       if(!t.isIndex){
-        const [per, inst, rev, fin] = await Promise.all([
+        const [per, inst, rev, fin, nw] = await Promise.all([
           tryFetch({dataset:"TaiwanStockPER", data_id:t.id, start_date:daysAgoISO(10)}),
           tryFetch({dataset:"TaiwanStockInstitutionalInvestorsBuySell", data_id:t.id, start_date:daysAgoISO(15)}),
           tryFetch({dataset:"TaiwanStockMonthRevenue", data_id:t.id, start_date:daysAgoISO(430)}),
           tryFetch({dataset:"TaiwanStockFinancialStatements", data_id:t.id, start_date:daysAgoISO(430)}),
+          tryFetch({dataset:"TaiwanStockNews", data_id:t.id, start_date:daysAgoISO(4)}),
         ]);
-        extra.per=per; extra.inst=inst; extra.rev=rev; extra.fin=fin;
+        extra.per=per; extra.inst=inst; extra.rev=rev; extra.fin=fin; news=nw;
       }
-      return {t, rows, st:buildStats(rows, extra)};
+      return {t, rows, st:buildStats(rows, extra), news};
     }));
     const totalInst = await totalInstP;
 
     content.innerHTML = results.map(r=>{
       const dr = r.t.isIndex ? detailRowsIndex(r.st, totalInst) : detailRowsStock(r.st);
-      return cardHTML(r.t, r.st, dr);
+      return cardHTML(r.t, r.st, dr, r.news);
     }).join("");
     results.forEach(r=>drawChart(r.t, r.rows));
 
