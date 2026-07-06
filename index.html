@@ -403,7 +403,10 @@ function drawChart(t, rows){
       },
       scales:{
         x:{ticks:{maxTicksLimit:6,font:{size:14}}},
-        y:{ticks:{font:{size:14}}, grace:"2%"}
+        y:{beginAtZero:false,
+           min:Math.floor(Math.min(...view.map(r=>r.min))*0.98),
+           max:Math.ceil(Math.max(...view.map(r=>r.max))*1.02),
+           ticks:{font:{size:14}}}
       }
     }
   }));
